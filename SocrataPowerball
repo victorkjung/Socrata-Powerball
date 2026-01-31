@@ -1,0 +1,871 @@
+from __future__ import annotations
+
+import datetime as dt
+import math
+import os
+import secrets
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import requests
+import streamlit as st
+
+if TYPE_CHECKING:
+    from plotly.graph_objects import Figure
+
+# -----------------------------
+# Constants & Configuration
+# -----------------------------
+DATASET_ID = "d6yy-54nr"
+ENDPOINT = f"https://data.ny.gov/resource/{DATASET_ID}.json"
+
+# Current Powerball rules (for simulator + input validation defaults)
+WHITE_POOL_SIZE = 69
+PB_POOL_SIZE = 26
+WHITE_BALLS_PER_DRAW = 5
+
+# API settings
+MAX_ROWS = 50_000
+API_CHUNK_SIZE = 5_000
+API_TIMEOUT_SECONDS = 30
+
+# Cache settings
+DEFAULT_TTL_HOURS = 6
+MIN_TTL_HOURS = 1
+MAX_TTL_HOURS = 48
+
+# UI settings
+MOBILE_BREAKPOINT = 768
+DEFAULT_CHART_HEIGHT = 650
+MOBILE_CHART_HEIGHT = 360
+
+st.set_page_config(
+    page_title="NY Powerball Analyzer",
+    layout="wide",
+    initial_sidebar_state="collapsed",  # mobile-friendly
+)
+
+# -----------------------------
+# Theme Configuration
+# -----------------------------
+@dataclass(frozen=True)
+class ThemeColors:
+    bg: str
+    panel: str
+    text: str
+    subtle: str
+    border: str
+
+DARK_THEME = ThemeColors(
+    bg="#0e1117",
+    panel="#161b22",
+    text="#e6edf3",
+    subtle="#9da7b1",
+    border="#30363d",
+)
+
+LIGHT_THEME = ThemeColors(
+    bg="#ffffff",
+    panel="#f6f8fa",
+    text="#111827",
+    subtle="#4b5563",
+    border="#e5e7eb",
+)
+
+
+def get_app_token() -> Optional[str]:
+    token = None
+    if hasattr(st, "secrets"):
+        token = st.secrets.get("SOCRATA_APP_TOKEN")
+    return token or os.environ.get("SOCRATA_APP_TOKEN")
+
+
+APP_TOKEN = get_app_token()
+
+
+# -----------------------------
+# CSS & Plotly Theme
+# -----------------------------
+def inject_responsive_css(dark: bool) -> None:
+    colors = DARK_THEME if dark else LIGHT_THEME
+
+    css = f"""
+<style>
+.stApp {{
+  background: {colors.bg};
+  color: {colors.text};
+}}
+section.main > div {{
+  padding-top: 0.75rem;
+}}
+section[data-testid="stSidebar"] > div {{
+  background: {colors.panel};
+  border-right: 1px solid {colors.border};
+}}
+html, body, [class*="css"] {{
+  color: {colors.text};
+}}
+small, .stCaption, .stMarkdown p, .stMarkdown li {{
+  color: {colors.subtle};
+}}
+div[data-baseweb="input"] input,
+div[data-baseweb="textarea"] textarea {{
+  background: {colors.panel};
+  color: {colors.text};
+  border-color: {colors.border};
+}}
+div[data-testid="stDataFrame"] {{
+  border: 1px solid {colors.border};
+  border-radius: 10px;
+  overflow: hidden;
+}}
+@media (max-width: {MOBILE_BREAKPOINT}px) {{
+  section.main > div {{
+    padding-left: 0.75rem !important;
+    padding-right: 0.75rem !important;
+  }}
+  div[data-testid="stHorizontalBlock"] {{
+    flex-direction: column !important;
+    gap: 0.75rem !important;
+  }}
+  .js-plotly-plot, .plotly, .plot-container {{
+    height: {MOBILE_CHART_HEIGHT}px !important;
+  }}
+  div[data-testid="stMetric"] {{
+    padding: 0.75rem !important;
+  }}
+}}
+</style>
+<meta name="theme-color" content="{colors.bg}">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+"""
+    st.markdown(css, unsafe_allow_html=True)
+
+
+def apply_plotly_theme(fig: "Figure", dark: bool, is_mobile: bool) -> "Figure":
+    template = "plotly_dark" if dark else "plotly_white"
+    font_size = 11 if is_mobile else 13
+    title_size = 14 if is_mobile else 18
+
+    fig.update_layout(
+        template=template,
+        margin=dict(l=16, r=16, t=56, b=24),
+        font=dict(size=font_size),
+        title=dict(font=dict(size=title_size), x=0.02, xanchor="left"),
+        legend=dict(
+            orientation="h" if is_mobile else "v",
+            yanchor="bottom" if is_mobile else "top",
+            y=-0.35 if is_mobile else 1,
+            x=0.5 if is_mobile else 1,
+            xanchor="center" if is_mobile else "right",
+            font=dict(size=10 if is_mobile else 12),
+        ),
+    )
+
+    if dark:
+        fig.update_traces(line=dict(width=2.5), selector=dict(type="scatter"))
+
+    return fig
+
+
+# -----------------------------
+# API & Data Fetching
+# -----------------------------
+class SocrataAPIError(Exception):
+    pass
+
+
+def _socrata_get(params: dict) -> list[dict]:
+    headers = {"X-App-Token": APP_TOKEN} if APP_TOKEN else {}
+    try:
+        resp = requests.get(
+            ENDPOINT,
+            params=params,
+            headers=headers,
+            timeout=API_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.Timeout as e:
+        raise SocrataAPIError("API request timed out. Please try again.") from e
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        if status == 429:
+            raise SocrataAPIError(
+                "Rate limit exceeded (HTTP 429). Add SOCRATA_APP_TOKEN in Streamlit Secrets to increase limits."
+            ) from e
+        raise SocrataAPIError(f"API error (HTTP {status}).") from e
+    except requests.exceptions.RequestException as e:
+        raise SocrataAPIError(f"Network error: {e}") from e
+
+
+def _parse_winning_numbers(s: object) -> Optional[list[int]]:
+    if s is None or (isinstance(s, float) and np.isnan(s)):
+        return None
+    parts = str(s).strip().split()
+    if len(parts) != 6:
+        return None
+    try:
+        return [int(x) for x in parts]
+    except ValueError:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def fetch_draws_from_api_cached(ttl_seconds: int) -> pd.DataFrame:
+    """
+    Cached API fetch (Option 1).
+    Cache key includes ttl_seconds so changing TTL triggers a new cache entry.
+    """
+    _ = ttl_seconds  # part of cache key by design
+
+    all_rows: list[dict] = []
+    offset = 0
+    select_fields = "draw_date,winning_numbers,multiplier"
+
+    while True:
+        params = {
+            "$select": select_fields,
+            "$order": "draw_date ASC",
+            "$limit": API_CHUNK_SIZE,
+            "$offset": offset,
+        }
+        chunk = _socrata_get(params)
+        if not chunk:
+            break
+
+        all_rows.extend(chunk)
+        offset += API_CHUNK_SIZE
+        if len(all_rows) >= MAX_ROWS:
+            break
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+
+    # robust datetime parsing
+    df["draw_date"] = pd.to_datetime(df["draw_date"], errors="coerce", utc=True).dt.tz_convert(None)
+    df["multiplier"] = pd.to_numeric(df.get("multiplier"), errors="coerce")
+
+    # parse numbers
+    df["nums"] = df["winning_numbers"].apply(_parse_winning_numbers)
+    df = df.dropna(subset=["draw_date", "nums"]).reset_index(drop=True)
+
+    if df.empty:
+        return df
+
+    df["white"] = df["nums"].apply(lambda x: x[:5])
+    df["pb"] = df["nums"].apply(lambda x: x[5])
+    df["year_month"] = df["draw_date"].dt.to_period("M").astype(str)
+
+    return df
+
+
+# -----------------------------
+# Analytics (Vectorized)
+# -----------------------------
+def explode_numbers(df: pd.DataFrame) -> pd.DataFrame:
+    # white balls
+    white_df = df[["draw_date", "year_month", "white"]].copy()
+    white_df = white_df.explode("white")
+    white_df = white_df.rename(columns={"white": "number"})
+    white_df["is_powerball"] = False
+    white_df["number"] = white_df["number"].astype(int)
+
+    # powerball
+    pb_df = df[["draw_date", "year_month", "pb"]].copy()
+    pb_df = pb_df.rename(columns={"pb": "number"})
+    pb_df["is_powerball"] = True
+    pb_df["number"] = pb_df["number"].astype(int)
+
+    return pd.concat([white_df, pb_df], ignore_index=True)
+
+
+def build_heatmap(long_df: pd.DataFrame, is_powerball: bool) -> pd.DataFrame:
+    filtered = long_df[long_df["is_powerball"] == is_powerball]
+    pivot = (
+        filtered.groupby(["year_month", "number"])
+        .size()
+        .reset_index(name="count")
+        .pivot(index="year_month", columns="number", values="count")
+        .fillna(0)
+        .astype(int)
+    )
+    return pivot.sort_index().reindex(sorted(pivot.columns), axis=1)
+
+
+def compute_win_percentage(long_df: pd.DataFrame, numbers: list[int], is_powerball: bool) -> pd.DataFrame:
+    filtered = long_df[long_df["is_powerball"] == is_powerball].copy()
+    month_totals = filtered.groupby("year_month")["draw_date"].nunique()
+
+    number_data = filtered[filtered["number"].isin(numbers)]
+    hits = (
+        number_data.groupby(["year_month", "number"])["draw_date"]
+        .nunique()
+        .reset_index(name="hits")
+    )
+
+    hits["total"] = hits["year_month"].map(month_totals)
+    hits["win_pct"] = (hits["hits"] / hits["total"] * 100).fillna(0.0)
+    return hits[["year_month", "number", "win_pct"]]
+
+
+def compute_top_bottom_numbers(long_df: pd.DataFrame) -> tuple[list[int], list[int], list[int], list[int]]:
+    white_counts = (
+        long_df[~long_df["is_powerball"]]["number"]
+        .value_counts()
+        .sort_values(ascending=False)
+    )
+    pb_counts = (
+        long_df[long_df["is_powerball"]]["number"]
+        .value_counts()
+        .sort_values(ascending=False)
+    )
+    return (
+        white_counts.head(5).index.tolist(),
+        white_counts.tail(5).index.tolist(),
+        pb_counts.head(1).index.tolist(),
+        pb_counts.tail(1).index.tolist(),
+    )
+
+
+def compute_hot_cold_scores(long_df: pd.DataFrame, is_powerball: bool, window_draws: int = 100) -> pd.DataFrame:
+    filtered = long_df[long_df["is_powerball"] == is_powerball].copy()
+    draws = filtered["draw_date"].drop_duplicates().sort_values()
+    if draws.empty or len(draws) < window_draws:
+        return pd.DataFrame()
+
+    recent_dates = set(draws.tail(window_draws))
+    total_draws = len(draws)
+    recent_draws = len(recent_dates)
+
+    total_counts = filtered["number"].value_counts()
+    recent_counts = filtered[filtered["draw_date"].isin(recent_dates)]["number"].value_counts()
+
+    all_numbers = total_counts.index
+    recent_counts = recent_counts.reindex(all_numbers, fill_value=0)
+
+    total_rate = total_counts / total_draws
+    recent_rate = recent_counts / recent_draws
+
+    p = total_rate.clip(1e-9, 1 - 1e-9)
+    se = np.sqrt(p * (1 - p) / max(recent_draws, 1))
+    z = (recent_rate - total_rate) / se
+
+    result = pd.DataFrame(
+        {
+            "number": all_numbers.astype(int),
+            "recent_rate": recent_rate.values,
+            "base_rate": total_rate.values,
+            "z_score": z.values,
+        }
+    ).replace([np.inf, -np.inf], np.nan)
+
+    result["score"] = result["z_score"].clip(-6, 6).fillna(0.0)
+    return result.sort_values("score", ascending=False).reset_index(drop=True)
+
+
+# -----------------------------
+# Probability (Exact + Monte Carlo)
+# -----------------------------
+def compute_exact_probabilities(white_pool: int, pb_pool: int) -> pd.DataFrame:
+    denom = math.comb(white_pool, 5) * pb_pool
+    rows = []
+    for w in range(0, 6):
+        ways_white = math.comb(5, w) * math.comb(white_pool - 5, 5 - w)
+        for pb_match in (0, 1):
+            ways_pb = 1 if pb_match else (pb_pool - 1)
+            p = (ways_white * ways_pb) / denom
+            rows.append((w, pb_match, p))
+    df = pd.DataFrame(rows, columns=["white_matches", "pb_match", "probability"])
+    df["pb_match"] = df["pb_match"].map({0: "No PB", 1: "PB"})
+    df["odds_1_in"] = (1 / df["probability"]).replace([np.inf], np.nan)
+    return df.sort_values(["white_matches", "pb_match"], ascending=[False, False])
+
+
+def simulate_lottery_sessions(
+    white_pool: int,
+    pb_pool: int,
+    num_draws: int,
+    num_sessions: int,
+    seed: Optional[int] = None,
+) -> pd.DataFrame:
+    if seed is None:
+        seed = secrets.randbelow(10**9)
+    rng = np.random.default_rng(seed)
+
+    results = []
+    for _ in range(num_sessions):
+        ticket_white = set(rng.choice(np.arange(1, white_pool + 1), size=5, replace=False))
+        ticket_pb = int(rng.integers(1, pb_pool + 1))
+
+        best = (0, 0)
+        for _d in range(num_draws):
+            draw_white = set(rng.choice(np.arange(1, white_pool + 1), size=5, replace=False))
+            draw_pb = int(rng.integers(1, pb_pool + 1))
+            wm = len(ticket_white & draw_white)
+            pm = 1 if draw_pb == ticket_pb else 0
+            if (wm, pm) > best:
+                best = (wm, pm)
+
+        results.append(best)
+
+    sim_df = pd.DataFrame(results, columns=["white_matches", "pb_match"])
+    sim_df["pb_match"] = sim_df["pb_match"].map({0: "No PB", 1: "PB"})
+    return sim_df
+
+
+# -----------------------------
+# Input Validation
+# -----------------------------
+def parse_white_balls(input_str: str, max_white: int) -> list[int]:
+    parts = [p.strip() for p in input_str.split(",") if p.strip()]
+    if len(parts) != 5:
+        raise ValueError("Please enter exactly 5 white ball numbers.")
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError as e:
+        raise ValueError("All white ball inputs must be valid integers.") from e
+    if len(set(nums)) != 5:
+        raise ValueError("White balls must be 5 distinct numbers.")
+    if not all(1 <= n <= max_white for n in nums):
+        raise ValueError(f"White balls must be between 1 and {max_white}.")
+    return sorted(nums)
+
+
+def validate_powerball(pb: int, max_pb: int) -> int:
+    if not (1 <= pb <= max_pb):
+        raise ValueError(f"Powerball must be between 1 and {max_pb}.")
+    return pb
+
+
+# -----------------------------
+# UI: Sidebar
+# -----------------------------
+def render_sidebar(dataset_white_max: int, dataset_pb_max: int) -> tuple[bool, int, str, str, int, bool, bool]:
+    with st.sidebar:
+        st.header("Controls")
+
+        st.subheader("Appearance")
+        dark_mode = st.toggle("🌙 Dark mode", value=True)
+
+        # "Mobile hint" toggle lets you force compact chart UI on desktop if desired
+        compact_mode = st.toggle("📱 Compact charts (mobile-style)", value=False)
+
+        if not APP_TOKEN:
+            st.error(
+                "Missing SOCRATA_APP_TOKEN.\n\n"
+                "The app will still run, but you may hit Socrata rate limits.\n\n"
+                "Streamlit Cloud → Settings → Secrets:\n"
+                'SOCRATA_APP_TOKEN = "YOUR_TOKEN"'
+            )
+
+        ttl_hours = st.slider("Cache TTL (hours)", MIN_TTL_HOURS, MAX_TTL_HOURS, DEFAULT_TTL_HOURS)
+
+        number_mode = st.radio(
+            "Show analytics for:",
+            ["Both", "White balls only", "Powerball only"],
+            index=0,
+        )
+
+        st.divider()
+        st.subheader("Mock Drawing")
+        st.caption("Enter 5 white balls + 1 Powerball. Order doesn’t matter for the 5 whites.")
+
+        # Validate against dataset ranges (not only current rules)
+        white_input = st.text_input("White balls (comma-separated)", value="1, 2, 3, 4, 5")
+        pb_input = st.number_input(
+            "Powerball",
+            min_value=1,
+            max_value=max(26, int(dataset_pb_max) if dataset_pb_max else 99),
+            value=6,
+            step=1,
+        )
+
+        st.divider()
+        refresh_now = st.button("🔄 Force refresh (clear cache + pull API)")
+
+    return dark_mode, ttl_hours, number_mode, white_input, int(pb_input), refresh_now, compact_mode
+
+
+# -----------------------------
+# Tab renderers
+# -----------------------------
+def render_latest_draw_summary(df: pd.DataFrame) -> None:
+    latest_row = (
+        df.dropna(subset=["draw_date", "white", "pb"])
+        .sort_values("draw_date", ascending=False)
+        .iloc[0]
+    )
+
+    latest_date = latest_row["draw_date"].date()
+    latest_white = sorted(int(x) for x in latest_row["white"])
+    latest_pb = int(latest_row["pb"])
+    latest_mult = latest_row.get("multiplier")
+
+    c1, c2, c3 = st.columns([1.2, 2.6, 1.2])
+    with c1:
+        st.metric("Most Recent Drawing", str(latest_date))
+    with c2:
+        st.markdown(
+            f"**Winning Numbers (5 White + 1 Powerball)**  \n"
+            f"White balls: **{latest_white}**  \n"
+            f"Powerball: **{latest_pb}**"
+        )
+    with c3:
+        mult_display = f"{int(latest_mult)}x" if pd.notna(latest_mult) else "—"
+        st.metric("Multiplier", mult_display)
+
+    st.caption(f"Rows: **{len(df):,}** | Latest draw in dataset: **{latest_date}**")
+
+
+def render_download_buttons(df: pd.DataFrame, long_df: pd.DataFrame) -> None:
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            "⬇ Download Draw Data (CSV)",
+            data=df.to_csv(index=False),
+            file_name="powerball_draws.csv",
+            mime="text/csv",
+        )
+    with col2:
+        st.download_button(
+            "⬇ Download Long Format (CSV)",
+            data=long_df.to_csv(index=False),
+            file_name="powerball_numbers_long.csv",
+            mime="text/csv",
+        )
+
+
+def render_tab_launcher() -> None:
+    st.subheader("Mobile Launcher")
+    st.caption("Quick launchpad. Add to Home Screen for an app-like experience.")
+
+    cols = st.columns(3)
+    buttons = [
+        ("🔥 Heat Maps", "Monthly frequency by number"),
+        ("🧠 Hot vs Cold", "Rolling trends vs baseline"),
+        ("🧮 Simulator", "Odds + Monte Carlo"),
+    ]
+    for col, (label, desc) in zip(cols, buttons):
+        with col:
+            st.button(label, use_container_width=True, disabled=True)
+            st.markdown(f"**{label}**: {desc}")
+
+    st.divider()
+    st.markdown("### Add to Home Screen")
+    st.markdown(
+        "- **iOS (Safari):** Share → *Add to Home Screen*\n"
+        "- **Android (Chrome):** Menu → *Add to Home screen*"
+    )
+
+
+def render_tab_heatmaps(long_df: pd.DataFrame, number_mode: str, dark_mode: bool, is_mobile: bool) -> None:
+    st.subheader("Heat Map of Winning Number Frequency (by Month)")
+
+    col_left, col_right = st.columns(2)
+    with col_left:
+        if number_mode in ["Both", "White balls only"]:
+            pivot = build_heatmap(long_df, is_powerball=False)
+            fig = px.imshow(
+                pivot,
+                aspect="auto",
+                labels=dict(x="Number", y="Year-Month", color="Count"),
+                title="White Ball Frequency Heatmap",
+            )
+            fig.update_layout(height=DEFAULT_CHART_HEIGHT)
+            apply_plotly_theme(fig, dark_mode, is_mobile)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Toggle is set to Powerball only.")
+
+    with col_right:
+        if number_mode in ["Both", "Powerball only"]:
+            pivot = build_heatmap(long_df, is_powerball=True)
+            fig = px.imshow(
+                pivot,
+                aspect="auto",
+                labels=dict(x="Number", y="Year-Month", color="Count"),
+                title="Powerball Frequency Heatmap",
+            )
+            fig.update_layout(height=DEFAULT_CHART_HEIGHT)
+            apply_plotly_theme(fig, dark_mode, is_mobile)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Toggle is set to White balls only.")
+
+
+def render_tab_top_bottom(
+    long_df: pd.DataFrame,
+    top5_white: list[int],
+    bot5_white: list[int],
+    top1_pb: list[int],
+    bot1_pb: list[int],
+    number_mode: str,
+    dark_mode: bool,
+    is_mobile: bool,
+) -> None:
+    st.subheader("Top 6 and Bottom 6 Numbers (5 White + 1 Powerball) + Win % Over Time")
+    st.info("Win % = % of draws in a month where the number appeared (white) or matched PB (powerball).")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### ✅ Top 6")
+        st.write("White (Top 5):", top5_white)
+        st.write("Powerball (Top 1):", top1_pb)
+    with col2:
+        st.markdown("### ❄️ Bottom 6")
+        st.write("White (Bottom 5):", bot5_white)
+        st.write("Powerball (Bottom 1):", bot1_pb)
+
+    if number_mode in ["Both", "White balls only"]:
+        st.markdown("### White Balls — Win % by Month")
+        for nums, title in [(top5_white, "Top 5 White Balls"), (bot5_white, "Bottom 5 White Balls")]:
+            series = compute_win_percentage(long_df, nums, is_powerball=False)
+            fig = px.line(series, x="year_month", y="win_pct", color="number", title=title)
+            fig.update_layout(height=320, xaxis_title="Year-Month", yaxis_title="Win %")
+            apply_plotly_theme(fig, dark_mode, is_mobile)
+            st.plotly_chart(fig, use_container_width=True)
+
+    if number_mode in ["Both", "Powerball only"]:
+        st.markdown("### Powerball — Win % by Month")
+        for nums, title in [(top1_pb, "Top 1 Powerball"), (bot1_pb, "Bottom 1 Powerball")]:
+            series = compute_win_percentage(long_df, nums, is_powerball=True)
+            fig = px.line(series, x="year_month", y="win_pct", color="number", title=title)
+            fig.update_layout(height=280, xaxis_title="Year-Month", yaxis_title="Win %")
+            apply_plotly_theme(fig, dark_mode, is_mobile)
+            st.plotly_chart(fig, use_container_width=True)
+
+
+def render_tab_mock_checker(df: pd.DataFrame, white_input: str, pb_input: int, max_white: int, max_pb: int) -> None:
+    st.subheader("Mock Drawing Checker (Exact Match)")
+    st.caption("Checks whether your exact combo (5 white unordered + PB) has ever been drawn.")
+
+    try:
+        user_white = parse_white_balls(white_input, max_white=max_white)
+        user_pb = validate_powerball(pb_input, max_pb=max_pb)
+
+        st.write(f"**Your Pick:** White balls: **{user_white}** | Powerball: **{user_pb}**")
+
+        df_check = df.copy()
+        df_check["white_key"] = df_check["white"].apply(lambda x: tuple(sorted(int(i) for i in x)))
+        df_check["pb_key"] = df_check["pb"].astype(int)
+
+        matches = df_check[(df_check["white_key"] == tuple(user_white)) & (df_check["pb_key"] == user_pb)]
+
+        if matches.empty:
+            st.error("No exact historical match found in this dataset.")
+        else:
+            st.success(f"✅ Found **{len(matches)}** exact match(es)!")
+            out = matches[["draw_date", "winning_numbers", "multiplier"]].copy()
+            out["draw_date"] = out["draw_date"].dt.date
+            out = out.sort_values("draw_date", ascending=False)
+            st.dataframe(out, use_container_width=True)
+
+    except ValueError as e:
+        st.error(str(e))
+
+
+def render_tab_simulator(long_df: pd.DataFrame, dark_mode: bool, is_mobile: bool) -> None:
+    st.subheader("🧮 Probability Simulator")
+    st.caption("Exact odds + Monte Carlo. Defaults to current Powerball rules: 5 from 1–69 + PB from 1–26.")
+
+    ds_white_max = int(long_df[~long_df["is_powerball"]]["number"].max())
+    ds_pb_max = int(long_df[long_df["is_powerball"]]["number"].max())
+
+    mode = st.radio(
+        "Number pools",
+        [
+            f"Current Powerball rules ({WHITE_POOL_SIZE} / {PB_POOL_SIZE})",
+            f"Dataset max ({ds_white_max} / {ds_pb_max})",
+        ],
+        index=0,
+    )
+
+    white_pool = WHITE_POOL_SIZE if "Current" in mode else max(5, ds_white_max)
+    pb_pool = PB_POOL_SIZE if "Current" in mode else max(2, ds_pb_max)
+
+    col1, col2, col3 = st.columns(3)
+    jackpot_odds = 1 / (math.comb(white_pool, 5) * pb_pool)
+    col1.metric("White pool", white_pool)
+    col2.metric("PB pool", pb_pool)
+    col3.metric("Jackpot odds", f"1 in {int(1/jackpot_odds):,}")
+
+    st.divider()
+    st.markdown("### Exact probabilities by match pattern")
+    prob_df = compute_exact_probabilities(white_pool, pb_pool)
+    st.dataframe(prob_df, use_container_width=True)
+
+    st.divider()
+    st.markdown("### Monte Carlo: play the same ticket for N draws")
+    c1, c2, c3 = st.columns(3)
+    num_draws = c1.number_input("Draws", 1, 5000, 365, step=1)
+    num_sessions = c2.number_input("Sessions", 100, 20000, 5000, step=100)
+    seed = c3.number_input("Seed", 0, 10**9, 42, step=1)
+
+    if st.button("Run simulation", type="primary"):
+        with st.spinner("Simulating…"):
+            sim_df = simulate_lottery_sessions(
+                white_pool, pb_pool, int(num_draws), int(num_sessions), int(seed)
+            )
+        summary = sim_df.value_counts().reset_index(name="count")
+        summary["pct"] = (summary["count"] / summary["count"].sum() * 100).round(2)
+
+        fig = px.bar(
+            summary,
+            x="white_matches",
+            y="pct",
+            color="pb_match",
+            title="Best match achieved per session (distribution)",
+        )
+        fig.update_layout(height=360, xaxis_title="White matches", yaxis_title="% of sessions")
+        apply_plotly_theme(fig, dark_mode, is_mobile)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.dataframe(summary.sort_values(["white_matches", "pb_match"], ascending=[False, False]),
+                     use_container_width=True)
+
+
+def render_tab_hot_cold(long_df: pd.DataFrame, dark_mode: bool, is_mobile: bool) -> None:
+    st.subheader("🧠 Hot vs Cold Trend Scoring")
+    st.caption("Compares the last N draws to the long-run baseline using a z-score-like signal.")
+
+    window = st.slider("Rolling window (draws)", 20, 400, 100, step=10)
+    ball_type = st.radio("Analyze", ["White balls", "Powerball"], horizontal=True)
+
+    is_pb = (ball_type == "Powerball")
+    scores = compute_hot_cold_scores(long_df, is_powerball=is_pb, window_draws=int(window))
+
+    if scores.empty:
+        st.info("Not enough data to compute scores.")
+        return
+
+    hot = scores.head(10)
+    cold = scores.tail(10).sort_values("score", ascending=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### 🔥 Hottest (Top 10)")
+        fig = px.bar(hot, x="number", y="score", title="Hot numbers (score)")
+        fig.update_layout(height=340, xaxis_title="Number", yaxis_title="Score")
+        apply_plotly_theme(fig, dark_mode, is_mobile)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.markdown("### 🧊 Coldest (Bottom 10)")
+        fig = px.bar(cold, x="number", y="score", title="Cold numbers (score)")
+        fig.update_layout(height=340, xaxis_title="Number", yaxis_title="Score")
+        apply_plotly_theme(fig, dark_mode, is_mobile)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.markdown("### Full table")
+    show_n = st.slider("Show top N by absolute score", 20, 200, 60, step=10)
+    scores = scores.copy()
+    scores["abs_score"] = scores["score"].abs()
+    view = scores.sort_values("abs_score", ascending=False).head(int(show_n)).drop(columns=["abs_score"])
+    st.dataframe(view, use_container_width=True)
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main() -> None:
+    st.title("🎯 NY Powerball Analyzer (Socrata API)")
+
+    # We need dataset max ranges for validation & UI.
+    # Use a small, fast fetch first? No: keep it simple — fetch once with cache.
+    # TTL slider is in sidebar; we must render sidebar after we know dataset max.
+    # So: do a "default TTL" fetch first; then sidebar can override.
+    default_df = fetch_draws_from_api_cached(ttl_seconds=int(DEFAULT_TTL_HOURS * 3600))
+    if default_df.empty:
+        dataset_white_max, dataset_pb_max = WHITE_POOL_SIZE, PB_POOL_SIZE
+    else:
+        tmp_long = explode_numbers(default_df)
+        dataset_white_max = int(tmp_long[~tmp_long["is_powerball"]]["number"].max())
+        dataset_pb_max = int(tmp_long[tmp_long["is_powerball"]]["number"].max())
+
+    dark_mode, ttl_hours, number_mode, white_input, pb_input, force_refresh, compact_mode = render_sidebar(
+        dataset_white_max=dataset_white_max,
+        dataset_pb_max=dataset_pb_max,
+    )
+
+    # Apply theme
+    inject_responsive_css(dark_mode)
+
+    # Mobile hint: CSS handles real layout; this drives chart typography.
+    is_mobile = compact_mode  # user-forced compact mode
+
+    # Force refresh: clear Streamlit cache so next call refetches
+    if force_refresh:
+        st.cache_data.clear()
+        st.toast("Cache cleared — fetching fresh data from API…", icon="🔄")
+
+    ttl_seconds = int(ttl_hours * 3600)
+
+    try:
+        with st.spinner("Loading draws from data.ny.gov…"):
+            df = fetch_draws_from_api_cached(ttl_seconds=ttl_seconds)
+    except SocrataAPIError as e:
+        st.error(f"API Error: {e}")
+        st.stop()
+
+    if df.empty:
+        st.error("No data returned from the API. Try refreshing or check connectivity.")
+        st.stop()
+
+    # Summary
+    render_latest_draw_summary(df)
+
+    # Long format
+    long_df = explode_numbers(df)
+
+    # Download buttons
+    render_download_buttons(df, long_df)
+
+    # Compute top/bottom
+    top5_white, bot5_white, top1_pb, bot1_pb = compute_top_bottom_numbers(long_df)
+
+    # Tabs
+    tab_names = ["📲 Launcher", "🔥 Heat Maps", "📈 Top/Bottom", "✅ Mock Checker", "🧮 Simulator", "🧠 Hot vs Cold"]
+    tabs = st.tabs(tab_names)
+
+    with tabs[0]:
+        render_tab_launcher()
+
+    with tabs[1]:
+        render_tab_heatmaps(long_df, number_mode, dark_mode, is_mobile)
+
+    with tabs[2]:
+        render_tab_top_bottom(
+            long_df, top5_white, bot5_white, top1_pb, bot1_pb, number_mode, dark_mode, is_mobile
+        )
+
+    with tabs[3]:
+        # validate against dataset max (not just current rules)
+        max_white = max(WHITE_POOL_SIZE, int(long_df[~long_df["is_powerball"]]["number"].max()))
+        max_pb = max(PB_POOL_SIZE, int(long_df[long_df["is_powerball"]]["number"].max()))
+        render_tab_mock_checker(df, white_input, pb_input, max_white=max_white, max_pb=max_pb)
+
+    with tabs[4]:
+        render_tab_simulator(long_df, dark_mode, is_mobile)
+
+    with tabs[5]:
+        render_tab_hot_cold(long_df, dark_mode, is_mobile)
+
+    with st.expander("Notes"):
+        st.markdown(
+            "- Cache is managed by **Streamlit** via `@st.cache_data`.\n"
+            "- Use **Force refresh** to clear the cache and pull fresh API data immediately.\n"
+            "- Hot/Cold scoring is descriptive (trend signal), not predictive.\n"
+            "- Lottery outcomes are independent events."
+        )
+
+
+if __name__ == "__main__":
+    main()
