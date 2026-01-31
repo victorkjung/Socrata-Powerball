@@ -292,23 +292,4 @@ Please see **CONTRIBUTING.md** for:
 * Historical rule change handling
 * Alerts for hot/cold number shifts
 
----
-
-```
-
----
-
-### 📌 How to use
-
-1. Create a file in your repo named:
-
-```
-
-README.md
-
-```
-
-2. Paste everything above into it.
-
-3. Commit & push to GitHub.
 
