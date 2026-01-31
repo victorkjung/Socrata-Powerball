@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import datetime as dt
 import math
 import os
 import secrets
@@ -17,12 +16,18 @@ if TYPE_CHECKING:
     from plotly.graph_objects import Figure
 
 # -----------------------------
-# Constants & Configuration
+# App Config
 # -----------------------------
+st.set_page_config(
+    page_title="NY Powerball Analyzer",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
 DATASET_ID = "d6yy-54nr"
 ENDPOINT = f"https://data.ny.gov/resource/{DATASET_ID}.json"
 
-# Current Powerball rules (for simulator + input validation defaults)
+# Current Powerball rules (used for UI + simulator defaults)
 WHITE_POOL_SIZE = 69
 PB_POOL_SIZE = 26
 WHITE_BALLS_PER_DRAW = 5
@@ -42,11 +47,15 @@ MOBILE_BREAKPOINT = 768
 DEFAULT_CHART_HEIGHT = 650
 MOBILE_CHART_HEIGHT = 360
 
-st.set_page_config(
-    page_title="NY Powerball Analyzer",
-    layout="wide",
-    initial_sidebar_state="collapsed",  # mobile-friendly
-)
+
+def get_app_token() -> Optional[str]:
+    token = None
+    if hasattr(st, "secrets"):
+        token = st.secrets.get("SOCRATA_APP_TOKEN")
+    return token or os.environ.get("SOCRATA_APP_TOKEN")
+
+
+APP_TOKEN = get_app_token()
 
 # -----------------------------
 # Theme Configuration
@@ -58,6 +67,7 @@ class ThemeColors:
     text: str
     subtle: str
     border: str
+
 
 DARK_THEME = ThemeColors(
     bg="#0e1117",
@@ -76,22 +86,8 @@ LIGHT_THEME = ThemeColors(
 )
 
 
-def get_app_token() -> Optional[str]:
-    token = None
-    if hasattr(st, "secrets"):
-        token = st.secrets.get("SOCRATA_APP_TOKEN")
-    return token or os.environ.get("SOCRATA_APP_TOKEN")
-
-
-APP_TOKEN = get_app_token()
-
-
-# -----------------------------
-# CSS & Plotly Theme
-# -----------------------------
 def inject_responsive_css(dark: bool) -> None:
     colors = DARK_THEME if dark else LIGHT_THEME
-
     css = f"""
 <style>
 .stApp {{
@@ -122,6 +118,7 @@ div[data-testid="stDataFrame"] {{
   border-radius: 10px;
   overflow: hidden;
 }}
+
 @media (max-width: {MOBILE_BREAKPOINT}px) {{
   section.main > div {{
     padding-left: 0.75rem !important;
@@ -146,29 +143,26 @@ div[data-testid="stDataFrame"] {{
     st.markdown(css, unsafe_allow_html=True)
 
 
-def apply_plotly_theme(fig: "Figure", dark: bool, is_mobile: bool) -> "Figure":
+def apply_plotly_theme(fig: "Figure", dark: bool, compact: bool) -> "Figure":
     template = "plotly_dark" if dark else "plotly_white"
-    font_size = 11 if is_mobile else 13
-    title_size = 14 if is_mobile else 18
-
+    font_size = 11 if compact else 13
+    title_size = 14 if compact else 18
     fig.update_layout(
         template=template,
         margin=dict(l=16, r=16, t=56, b=24),
         font=dict(size=font_size),
         title=dict(font=dict(size=title_size), x=0.02, xanchor="left"),
         legend=dict(
-            orientation="h" if is_mobile else "v",
-            yanchor="bottom" if is_mobile else "top",
-            y=-0.35 if is_mobile else 1,
-            x=0.5 if is_mobile else 1,
-            xanchor="center" if is_mobile else "right",
-            font=dict(size=10 if is_mobile else 12),
+            orientation="h" if compact else "v",
+            yanchor="bottom" if compact else "top",
+            y=-0.35 if compact else 1,
+            x=0.5 if compact else 1,
+            xanchor="center" if compact else "right",
+            font=dict(size=10 if compact else 12),
         ),
     )
-
     if dark:
         fig.update_traces(line=dict(width=2.5), selector=dict(type="scatter"))
-
     return fig
 
 
@@ -218,10 +212,9 @@ def _parse_winning_numbers(s: object) -> Optional[list[int]]:
 @st.cache_data(show_spinner=False)
 def fetch_draws_from_api_cached(ttl_seconds: int) -> pd.DataFrame:
     """
-    Cached API fetch (Option 1).
-    Cache key includes ttl_seconds so changing TTL triggers a new cache entry.
+    Cached API pull. ttl_seconds is included so cache key changes with TTL selection.
     """
-    _ = ttl_seconds  # part of cache key by design
+    _ = ttl_seconds
 
     all_rows: list[dict] = []
     offset = 0
@@ -240,6 +233,7 @@ def fetch_draws_from_api_cached(ttl_seconds: int) -> pd.DataFrame:
 
         all_rows.extend(chunk)
         offset += API_CHUNK_SIZE
+
         if len(all_rows) >= MAX_ROWS:
             break
 
@@ -248,14 +242,12 @@ def fetch_draws_from_api_cached(ttl_seconds: int) -> pd.DataFrame:
 
     df = pd.DataFrame(all_rows)
 
-    # robust datetime parsing
+    # Parse dates to naive datetime (no timezone) for easier charting
     df["draw_date"] = pd.to_datetime(df["draw_date"], errors="coerce", utc=True).dt.tz_convert(None)
     df["multiplier"] = pd.to_numeric(df.get("multiplier"), errors="coerce")
 
-    # parse numbers
     df["nums"] = df["winning_numbers"].apply(_parse_winning_numbers)
     df = df.dropna(subset=["draw_date", "nums"]).reset_index(drop=True)
-
     if df.empty:
         return df
 
@@ -267,19 +259,15 @@ def fetch_draws_from_api_cached(ttl_seconds: int) -> pd.DataFrame:
 
 
 # -----------------------------
-# Analytics (Vectorized)
+# Analytics Helpers
 # -----------------------------
 def explode_numbers(df: pd.DataFrame) -> pd.DataFrame:
-    # white balls
     white_df = df[["draw_date", "year_month", "white"]].copy()
-    white_df = white_df.explode("white")
-    white_df = white_df.rename(columns={"white": "number"})
+    white_df = white_df.explode("white").rename(columns={"white": "number"})
     white_df["is_powerball"] = False
     white_df["number"] = white_df["number"].astype(int)
 
-    # powerball
-    pb_df = df[["draw_date", "year_month", "pb"]].copy()
-    pb_df = pb_df.rename(columns={"pb": "number"})
+    pb_df = df[["draw_date", "year_month", "pb"]].copy().rename(columns={"pb": "number"})
     pb_df["is_powerball"] = True
     pb_df["number"] = pb_df["number"].astype(int)
 
@@ -337,6 +325,7 @@ def compute_top_bottom_numbers(long_df: pd.DataFrame) -> tuple[list[int], list[i
 def compute_hot_cold_scores(long_df: pd.DataFrame, is_powerball: bool, window_draws: int = 100) -> pd.DataFrame:
     filtered = long_df[long_df["is_powerball"] == is_powerball].copy()
     draws = filtered["draw_date"].drop_duplicates().sort_values()
+
     if draws.empty or len(draws) < window_draws:
         return pd.DataFrame()
 
@@ -371,7 +360,7 @@ def compute_hot_cold_scores(long_df: pd.DataFrame, is_powerball: bool, window_dr
 
 
 # -----------------------------
-# Probability (Exact + Monte Carlo)
+# Probability Helpers
 # -----------------------------
 def compute_exact_probabilities(white_pool: int, pb_pool: int) -> pd.DataFrame:
     denom = math.comb(white_pool, 5) * pb_pool
@@ -382,6 +371,7 @@ def compute_exact_probabilities(white_pool: int, pb_pool: int) -> pd.DataFrame:
             ways_pb = 1 if pb_match else (pb_pool - 1)
             p = (ways_white * ways_pb) / denom
             rows.append((w, pb_match, p))
+
     df = pd.DataFrame(rows, columns=["white_matches", "pb_match", "probability"])
     df["pb_match"] = df["pb_match"].map({0: "No PB", 1: "PB"})
     df["odds_1_in"] = (1 / df["probability"]).replace([np.inf], np.nan)
@@ -421,18 +411,13 @@ def simulate_lottery_sessions(
 
 
 # -----------------------------
-# Input Validation
+# Input Validation (Pickers)
 # -----------------------------
-def parse_white_balls(input_str: str, max_white: int) -> list[int]:
-    parts = [p.strip() for p in input_str.split(",") if p.strip()]
-    if len(parts) != 5:
-        raise ValueError("Please enter exactly 5 white ball numbers.")
-    try:
-        nums = [int(p) for p in parts]
-    except ValueError as e:
-        raise ValueError("All white ball inputs must be valid integers.") from e
+def validate_white_balls(nums: list[int], max_white: int) -> list[int]:
+    if len(nums) != 5:
+        raise ValueError("Please pick exactly 5 white ball numbers.")
     if len(set(nums)) != 5:
-        raise ValueError("White balls must be 5 distinct numbers.")
+        raise ValueError("White balls must be 5 distinct numbers (no duplicates).")
     if not all(1 <= n <= max_white for n in nums):
         raise ValueError(f"White balls must be between 1 and {max_white}.")
     return sorted(nums)
@@ -445,56 +430,7 @@ def validate_powerball(pb: int, max_pb: int) -> int:
 
 
 # -----------------------------
-# UI: Sidebar
-# -----------------------------
-def render_sidebar(dataset_white_max: int, dataset_pb_max: int) -> tuple[bool, int, str, str, int, bool, bool]:
-    with st.sidebar:
-        st.header("Controls")
-
-        st.subheader("Appearance")
-        dark_mode = st.toggle("🌙 Dark mode", value=True)
-
-        # "Mobile hint" toggle lets you force compact chart UI on desktop if desired
-        compact_mode = st.toggle("📱 Compact charts (mobile-style)", value=False)
-
-        if not APP_TOKEN:
-            st.error(
-                "Missing SOCRATA_APP_TOKEN.\n\n"
-                "The app will still run, but you may hit Socrata rate limits.\n\n"
-                "Streamlit Cloud → Settings → Secrets:\n"
-                'SOCRATA_APP_TOKEN = "YOUR_TOKEN"'
-            )
-
-        ttl_hours = st.slider("Cache TTL (hours)", MIN_TTL_HOURS, MAX_TTL_HOURS, DEFAULT_TTL_HOURS)
-
-        number_mode = st.radio(
-            "Show analytics for:",
-            ["Both", "White balls only", "Powerball only"],
-            index=0,
-        )
-
-        st.divider()
-        st.subheader("Mock Drawing")
-        st.caption("Enter 5 white balls + 1 Powerball. Order doesn’t matter for the 5 whites.")
-
-        # Validate against dataset ranges (not only current rules)
-        white_input = st.text_input("White balls (comma-separated)", value="1, 2, 3, 4, 5")
-        pb_input = st.number_input(
-            "Powerball",
-            min_value=1,
-            max_value=max(26, int(dataset_pb_max) if dataset_pb_max else 99),
-            value=6,
-            step=1,
-        )
-
-        st.divider()
-        refresh_now = st.button("🔄 Force refresh (clear cache + pull API)")
-
-    return dark_mode, ttl_hours, number_mode, white_input, int(pb_input), refresh_now, compact_mode
-
-
-# -----------------------------
-# Tab renderers
+# UI Components
 # -----------------------------
 def render_latest_draw_summary(df: pd.DataFrame) -> None:
     latest_row = (
@@ -502,7 +438,6 @@ def render_latest_draw_summary(df: pd.DataFrame) -> None:
         .sort_values("draw_date", ascending=False)
         .iloc[0]
     )
-
     latest_date = latest_row["draw_date"].date()
     latest_white = sorted(int(x) for x in latest_row["white"])
     latest_pb = int(latest_row["pb"])
@@ -542,17 +477,103 @@ def render_download_buttons(df: pd.DataFrame, long_df: pd.DataFrame) -> None:
         )
 
 
+# -----------------------------
+# Sidebar (Mobile Pickers + Clear/Reset)
+# -----------------------------
+def render_sidebar() -> tuple[bool, int, str, list[int], int, bool, bool]:
+    DEFAULT_WHITES = [1, 2, 3, 4, 5]
+    DEFAULT_PB = 6
+
+    # Initialize picker state once
+    for i, v in enumerate(DEFAULT_WHITES, start=1):
+        st.session_state.setdefault(f"white_{i}", v)
+    st.session_state.setdefault("pb_pick", DEFAULT_PB)
+
+    with st.sidebar:
+        st.header("Controls")
+
+        st.subheader("Appearance")
+        dark_mode = st.toggle("🌙 Dark mode", value=True)
+        compact_mode = st.toggle("📱 Compact charts (mobile-style)", value=False)
+
+        if not APP_TOKEN:
+            st.error(
+                "Missing SOCRATA_APP_TOKEN.\n\n"
+                "The app will still run, but you may hit Socrata rate limits.\n\n"
+                "Streamlit Cloud → Settings → Secrets:\n"
+                'SOCRATA_APP_TOKEN = "YOUR_TOKEN"'
+            )
+
+        ttl_hours = st.slider("Cache TTL (hours)", MIN_TTL_HOURS, MAX_TTL_HOURS, DEFAULT_TTL_HOURS)
+
+        number_mode = st.radio(
+            "Show analytics for:",
+            ["Both", "White balls only", "Powerball only"],
+            index=0,
+        )
+
+        st.divider()
+        st.subheader("Mock Drawing")
+        st.caption("Tap to pick 5 white balls + 1 Powerball.")
+
+        # Clear / Reset
+        if st.button("🧹 Clear / Reset numbers", use_container_width=True):
+            for i, v in enumerate(DEFAULT_WHITES, start=1):
+                st.session_state[f"white_{i}"] = v
+            st.session_state["pb_pick"] = DEFAULT_PB
+            st.toast("Numbers reset.", icon="🧹")
+            st.rerun()
+
+        st.markdown("**White balls (pick 5):**")
+        w_cols = st.columns(5)
+
+        white_picks: list[int] = []
+        for i, col in enumerate(w_cols, start=1):
+            with col:
+                white_picks.append(
+                    int(
+                        st.number_input(
+                            f"W{i}",
+                            min_value=1,
+                            max_value=WHITE_POOL_SIZE,
+                            step=1,
+                            key=f"white_{i}",
+                            label_visibility="collapsed",
+                        )
+                    )
+                )
+
+        st.markdown("**Powerball (pick 1):**")
+        pb_pick = int(
+            st.number_input(
+                "PB",
+                min_value=1,
+                max_value=PB_POOL_SIZE,
+                step=1,
+                key="pb_pick",
+                label_visibility="collapsed",
+            )
+        )
+
+        st.divider()
+        refresh_now = st.button("🔄 Force refresh (clear cache + pull API)")
+
+    return dark_mode, ttl_hours, number_mode, white_picks, pb_pick, refresh_now, compact_mode
+
+
+# -----------------------------
+# Tabs
+# -----------------------------
 def render_tab_launcher() -> None:
     st.subheader("Mobile Launcher")
     st.caption("Quick launchpad. Add to Home Screen for an app-like experience.")
-
     cols = st.columns(3)
-    buttons = [
+    cards = [
         ("🔥 Heat Maps", "Monthly frequency by number"),
         ("🧠 Hot vs Cold", "Rolling trends vs baseline"),
         ("🧮 Simulator", "Odds + Monte Carlo"),
     ]
-    for col, (label, desc) in zip(cols, buttons):
+    for col, (label, desc) in zip(cols, cards):
         with col:
             st.button(label, use_container_width=True, disabled=True)
             st.markdown(f"**{label}**: {desc}")
@@ -565,10 +586,10 @@ def render_tab_launcher() -> None:
     )
 
 
-def render_tab_heatmaps(long_df: pd.DataFrame, number_mode: str, dark_mode: bool, is_mobile: bool) -> None:
+def render_tab_heatmaps(long_df: pd.DataFrame, number_mode: str, dark_mode: bool, compact: bool) -> None:
     st.subheader("Heat Map of Winning Number Frequency (by Month)")
-
     col_left, col_right = st.columns(2)
+
     with col_left:
         if number_mode in ["Both", "White balls only"]:
             pivot = build_heatmap(long_df, is_powerball=False)
@@ -579,7 +600,7 @@ def render_tab_heatmaps(long_df: pd.DataFrame, number_mode: str, dark_mode: bool
                 title="White Ball Frequency Heatmap",
             )
             fig.update_layout(height=DEFAULT_CHART_HEIGHT)
-            apply_plotly_theme(fig, dark_mode, is_mobile)
+            apply_plotly_theme(fig, dark_mode, compact)
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Toggle is set to Powerball only.")
@@ -594,7 +615,7 @@ def render_tab_heatmaps(long_df: pd.DataFrame, number_mode: str, dark_mode: bool
                 title="Powerball Frequency Heatmap",
             )
             fig.update_layout(height=DEFAULT_CHART_HEIGHT)
-            apply_plotly_theme(fig, dark_mode, is_mobile)
+            apply_plotly_theme(fig, dark_mode, compact)
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Toggle is set to White balls only.")
@@ -602,14 +623,12 @@ def render_tab_heatmaps(long_df: pd.DataFrame, number_mode: str, dark_mode: bool
 
 def render_tab_top_bottom(
     long_df: pd.DataFrame,
-    top5_white: list[int],
-    bot5_white: list[int],
-    top1_pb: list[int],
-    bot1_pb: list[int],
     number_mode: str,
     dark_mode: bool,
-    is_mobile: bool,
+    compact: bool,
 ) -> None:
+    top5_white, bot5_white, top1_pb, bot1_pb = compute_top_bottom_numbers(long_df)
+
     st.subheader("Top 6 and Bottom 6 Numbers (5 White + 1 Powerball) + Win % Over Time")
     st.info("Win % = % of draws in a month where the number appeared (white) or matched PB (powerball).")
 
@@ -629,7 +648,7 @@ def render_tab_top_bottom(
             series = compute_win_percentage(long_df, nums, is_powerball=False)
             fig = px.line(series, x="year_month", y="win_pct", color="number", title=title)
             fig.update_layout(height=320, xaxis_title="Year-Month", yaxis_title="Win %")
-            apply_plotly_theme(fig, dark_mode, is_mobile)
+            apply_plotly_theme(fig, dark_mode, compact)
             st.plotly_chart(fig, use_container_width=True)
 
     if number_mode in ["Both", "Powerball only"]:
@@ -638,17 +657,22 @@ def render_tab_top_bottom(
             series = compute_win_percentage(long_df, nums, is_powerball=True)
             fig = px.line(series, x="year_month", y="win_pct", color="number", title=title)
             fig.update_layout(height=280, xaxis_title="Year-Month", yaxis_title="Win %")
-            apply_plotly_theme(fig, dark_mode, is_mobile)
+            apply_plotly_theme(fig, dark_mode, compact)
             st.plotly_chart(fig, use_container_width=True)
 
 
-def render_tab_mock_checker(df: pd.DataFrame, white_input: str, pb_input: int, max_white: int, max_pb: int) -> None:
+def render_tab_mock_checker(df: pd.DataFrame, white_picks: list[int], pb_pick: int) -> None:
     st.subheader("Mock Drawing Checker (Exact Match)")
-    st.caption("Checks whether your exact combo (5 white unordered + PB) has ever been drawn.")
+    st.caption("Pick your numbers in the sidebar, then click **Check my numbers**.")
+
+    check = st.button("✅ Check my numbers", type="primary")
+    if not check:
+        st.info("Select 5 white balls and 1 Powerball in the sidebar, then click **Check my numbers**.")
+        return
 
     try:
-        user_white = parse_white_balls(white_input, max_white=max_white)
-        user_pb = validate_powerball(pb_input, max_pb=max_pb)
+        user_white = validate_white_balls(white_picks, max_white=WHITE_POOL_SIZE)
+        user_pb = validate_powerball(pb_pick, max_pb=PB_POOL_SIZE)
 
         st.write(f"**Your Pick:** White balls: **{user_white}** | Powerball: **{user_pb}**")
 
@@ -659,7 +683,7 @@ def render_tab_mock_checker(df: pd.DataFrame, white_input: str, pb_input: int, m
         matches = df_check[(df_check["white_key"] == tuple(user_white)) & (df_check["pb_key"] == user_pb)]
 
         if matches.empty:
-            st.error("No exact historical match found in this dataset.")
+            st.warning("No exact historical match found in this dataset.")
         else:
             st.success(f"✅ Found **{len(matches)}** exact match(es)!")
             out = matches[["draw_date", "winning_numbers", "multiplier"]].copy()
@@ -671,24 +695,12 @@ def render_tab_mock_checker(df: pd.DataFrame, white_input: str, pb_input: int, m
         st.error(str(e))
 
 
-def render_tab_simulator(long_df: pd.DataFrame, dark_mode: bool, is_mobile: bool) -> None:
+def render_tab_simulator(long_df: pd.DataFrame, dark_mode: bool, compact: bool) -> None:
     st.subheader("🧮 Probability Simulator")
-    st.caption("Exact odds + Monte Carlo. Defaults to current Powerball rules: 5 from 1–69 + PB from 1–26.")
+    st.caption("Exact odds + Monte Carlo simulation.")
 
-    ds_white_max = int(long_df[~long_df["is_powerball"]]["number"].max())
-    ds_pb_max = int(long_df[long_df["is_powerball"]]["number"].max())
-
-    mode = st.radio(
-        "Number pools",
-        [
-            f"Current Powerball rules ({WHITE_POOL_SIZE} / {PB_POOL_SIZE})",
-            f"Dataset max ({ds_white_max} / {ds_pb_max})",
-        ],
-        index=0,
-    )
-
-    white_pool = WHITE_POOL_SIZE if "Current" in mode else max(5, ds_white_max)
-    pb_pool = PB_POOL_SIZE if "Current" in mode else max(2, ds_pb_max)
+    white_pool = WHITE_POOL_SIZE
+    pb_pool = PB_POOL_SIZE
 
     col1, col2, col3 = st.columns(3)
     jackpot_odds = 1 / (math.comb(white_pool, 5) * pb_pool)
@@ -703,6 +715,7 @@ def render_tab_simulator(long_df: pd.DataFrame, dark_mode: bool, is_mobile: bool
 
     st.divider()
     st.markdown("### Monte Carlo: play the same ticket for N draws")
+
     c1, c2, c3 = st.columns(3)
     num_draws = c1.number_input("Draws", 1, 5000, 365, step=1)
     num_sessions = c2.number_input("Sessions", 100, 20000, 5000, step=100)
@@ -710,28 +723,23 @@ def render_tab_simulator(long_df: pd.DataFrame, dark_mode: bool, is_mobile: bool
 
     if st.button("Run simulation", type="primary"):
         with st.spinner("Simulating…"):
-            sim_df = simulate_lottery_sessions(
-                white_pool, pb_pool, int(num_draws), int(num_sessions), int(seed)
-            )
+            sim_df = simulate_lottery_sessions(white_pool, pb_pool, int(num_draws), int(num_sessions), int(seed))
+
         summary = sim_df.value_counts().reset_index(name="count")
         summary["pct"] = (summary["count"] / summary["count"].sum() * 100).round(2)
 
-        fig = px.bar(
-            summary,
-            x="white_matches",
-            y="pct",
-            color="pb_match",
-            title="Best match achieved per session (distribution)",
-        )
+        fig = px.bar(summary, x="white_matches", y="pct", color="pb_match", title="Best match achieved per session")
         fig.update_layout(height=360, xaxis_title="White matches", yaxis_title="% of sessions")
-        apply_plotly_theme(fig, dark_mode, is_mobile)
+        apply_plotly_theme(fig, dark_mode, compact)
         st.plotly_chart(fig, use_container_width=True)
 
-        st.dataframe(summary.sort_values(["white_matches", "pb_match"], ascending=[False, False]),
-                     use_container_width=True)
+        st.dataframe(
+            summary.sort_values(["white_matches", "pb_match"], ascending=[False, False]),
+            use_container_width=True,
+        )
 
 
-def render_tab_hot_cold(long_df: pd.DataFrame, dark_mode: bool, is_mobile: bool) -> None:
+def render_tab_hot_cold(long_df: pd.DataFrame, dark_mode: bool, compact: bool) -> None:
     st.subheader("🧠 Hot vs Cold Trend Scoring")
     st.caption("Compares the last N draws to the long-run baseline using a z-score-like signal.")
 
@@ -753,19 +761,20 @@ def render_tab_hot_cold(long_df: pd.DataFrame, dark_mode: bool, is_mobile: bool)
         st.markdown("### 🔥 Hottest (Top 10)")
         fig = px.bar(hot, x="number", y="score", title="Hot numbers (score)")
         fig.update_layout(height=340, xaxis_title="Number", yaxis_title="Score")
-        apply_plotly_theme(fig, dark_mode, is_mobile)
+        apply_plotly_theme(fig, dark_mode, compact)
         st.plotly_chart(fig, use_container_width=True)
 
     with col2:
         st.markdown("### 🧊 Coldest (Bottom 10)")
         fig = px.bar(cold, x="number", y="score", title="Cold numbers (score)")
         fig.update_layout(height=340, xaxis_title="Number", yaxis_title="Score")
-        apply_plotly_theme(fig, dark_mode, is_mobile)
+        apply_plotly_theme(fig, dark_mode, compact)
         st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
     st.markdown("### Full table")
     show_n = st.slider("Show top N by absolute score", 20, 200, 60, step=10)
+
     scores = scores.copy()
     scores["abs_score"] = scores["score"].abs()
     view = scores.sort_values("abs_score", ascending=False).head(int(show_n)).drop(columns=["abs_score"])
@@ -778,30 +787,9 @@ def render_tab_hot_cold(long_df: pd.DataFrame, dark_mode: bool, is_mobile: bool)
 def main() -> None:
     st.title("🎯 NY Powerball Analyzer (Socrata API)")
 
-    # We need dataset max ranges for validation & UI.
-    # Use a small, fast fetch first? No: keep it simple — fetch once with cache.
-    # TTL slider is in sidebar; we must render sidebar after we know dataset max.
-    # So: do a "default TTL" fetch first; then sidebar can override.
-    default_df = fetch_draws_from_api_cached(ttl_seconds=int(DEFAULT_TTL_HOURS * 3600))
-    if default_df.empty:
-        dataset_white_max, dataset_pb_max = WHITE_POOL_SIZE, PB_POOL_SIZE
-    else:
-        tmp_long = explode_numbers(default_df)
-        dataset_white_max = int(tmp_long[~tmp_long["is_powerball"]]["number"].max())
-        dataset_pb_max = int(tmp_long[tmp_long["is_powerball"]]["number"].max())
-
-    dark_mode, ttl_hours, number_mode, white_input, pb_input, force_refresh, compact_mode = render_sidebar(
-        dataset_white_max=dataset_white_max,
-        dataset_pb_max=dataset_pb_max,
-    )
-
-    # Apply theme
+    dark_mode, ttl_hours, number_mode, white_picks, pb_pick, force_refresh, compact_mode = render_sidebar()
     inject_responsive_css(dark_mode)
 
-    # Mobile hint: CSS handles real layout; this drives chart typography.
-    is_mobile = compact_mode  # user-forced compact mode
-
-    # Force refresh: clear Streamlit cache so next call refetches
     if force_refresh:
         st.cache_data.clear()
         st.toast("Cache cleared — fetching fresh data from API…", icon="🔄")
@@ -819,49 +807,36 @@ def main() -> None:
         st.error("No data returned from the API. Try refreshing or check connectivity.")
         st.stop()
 
-    # Summary
     render_latest_draw_summary(df)
 
-    # Long format
     long_df = explode_numbers(df)
 
-    # Download buttons
     render_download_buttons(df, long_df)
 
-    # Compute top/bottom
-    top5_white, bot5_white, top1_pb, bot1_pb = compute_top_bottom_numbers(long_df)
-
-    # Tabs
-    tab_names = ["📲 Launcher", "🔥 Heat Maps", "📈 Top/Bottom", "✅ Mock Checker", "🧮 Simulator", "🧠 Hot vs Cold"]
-    tabs = st.tabs(tab_names)
+    tabs = st.tabs(["📲 Launcher", "🔥 Heat Maps", "📈 Top/Bottom", "✅ Mock Checker", "🧮 Simulator", "🧠 Hot vs Cold"])
 
     with tabs[0]:
         render_tab_launcher()
 
     with tabs[1]:
-        render_tab_heatmaps(long_df, number_mode, dark_mode, is_mobile)
+        render_tab_heatmaps(long_df, number_mode, dark_mode, compact_mode)
 
     with tabs[2]:
-        render_tab_top_bottom(
-            long_df, top5_white, bot5_white, top1_pb, bot1_pb, number_mode, dark_mode, is_mobile
-        )
+        render_tab_top_bottom(long_df, number_mode, dark_mode, compact_mode)
 
     with tabs[3]:
-        # validate against dataset max (not just current rules)
-        max_white = max(WHITE_POOL_SIZE, int(long_df[~long_df["is_powerball"]]["number"].max()))
-        max_pb = max(PB_POOL_SIZE, int(long_df[long_df["is_powerball"]]["number"].max()))
-        render_tab_mock_checker(df, white_input, pb_input, max_white=max_white, max_pb=max_pb)
+        render_tab_mock_checker(df, white_picks, pb_pick)
 
     with tabs[4]:
-        render_tab_simulator(long_df, dark_mode, is_mobile)
+        render_tab_simulator(long_df, dark_mode, compact_mode)
 
     with tabs[5]:
-        render_tab_hot_cold(long_df, dark_mode, is_mobile)
+        render_tab_hot_cold(long_df, dark_mode, compact_mode)
 
     with st.expander("Notes"):
         st.markdown(
-            "- Cache is managed by **Streamlit** via `@st.cache_data`.\n"
-            "- Use **Force refresh** to clear the cache and pull fresh API data immediately.\n"
+            "- Cache is managed by Streamlit via `@st.cache_data`.\n"
+            "- Use **Force refresh** to clear the cache and pull fresh API data.\n"
             "- Hot/Cold scoring is descriptive (trend signal), not predictive.\n"
             "- Lottery outcomes are independent events."
         )
