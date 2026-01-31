@@ -1,0 +1,32 @@
+name: CI (pytest)
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * *"   # daily 6:00 UTC
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        env:
+          # Optional: add SOCRATA_APP_TOKEN as a GitHub Actions secret
+          SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+        run: |
+          pytest -q
